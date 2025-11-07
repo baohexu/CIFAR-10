@@ -1,0 +1,119 @@
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+import optax
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import numpy as np
+
+BATCH_SIZE = 64
+LEARNING_RATE = 3e-4
+EPOCHS = 10
+DEVICE = jax.devices()[0]
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+])
+
+train_loader = DataLoader(
+    datasets.CIFAR10("./data", train=True, download=True, transform=transform),
+    batch_size=BATCH_SIZE, shuffle=True
+)
+
+test_loader = DataLoader(
+    datasets.CIFAR10("./data", train=False, download=True, transform=transform),
+    batch_size=BATCH_SIZE, shuffle=False
+)
+
+class SimpleCNN(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Conv(features=32, kernel_size=(3, 3), padding="SAME")(x)
+        x = nn.relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+        
+        x = nn.Conv(features=64, kernel_size=(3, 3), padding="SAME")(x)
+        x = nn.relu(x)
+        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+        
+        x = x.reshape(x.shape[0], -1)
+        x = nn.Dense(features=256)(x)
+        x = nn.relu(x)
+        x = nn.Dense(features=10)(x)
+        return x
+
+def create_train_state(rng):
+    model = SimpleCNN()
+    dummy_input = jnp.ones([1, 32, 32, 3])
+    params = model.init(rng, dummy_input)['params']
+    tx = optax.adam(learning_rate=LEARNING_RATE)
+    opt_state = tx.init(params)
+    return model, params, tx, opt_state
+
+def compute_loss(params, images, labels):
+    logits = model.apply({'params': params}, images)
+    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
+    return loss
+
+@jax.jit
+def train_step(params, opt_state, images, labels):
+    loss, grads = jax.value_and_grad(compute_loss)(params, images, labels)
+    updates, opt_state = tx.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+    return params, opt_state, loss
+
+@jax.jit
+def eval_step(params, images, labels):
+    logits = model.apply({'params': params}, images)
+    predictions = jnp.argmax(logits, axis=1)
+    accuracy = jnp.mean(predictions == labels)
+    return accuracy
+
+def prepare_batch(batch):
+    images = jnp.array(batch[0].numpy())
+    images = jnp.transpose(images, (0, 2, 3, 1))
+    labels = jnp.array(batch[1].numpy(), dtype=jnp.int32)
+    return images, labels
+
+def main():
+    rng = jax.random.PRNGKey(42)
+    global model, tx
+    model, params, tx, opt_state = create_train_state(rng)
+    
+    for epoch in range(EPOCHS):
+        train_losses = []
+        for batch in train_loader:
+            images, labels = prepare_batch(batch)
+            images = jax.device_put(images, DEVICE)
+            labels = jax.device_put(labels, DEVICE)
+            params, opt_state, loss = train_step(params, opt_state, images, labels)
+            train_losses.append(loss)
+        
+        accuracies = []
+        for batch in test_loader:
+            images, labels = prepare_batch(batch)
+            images = jax.device_put(images, DEVICE)
+            labels = jax.device_put(labels, DEVICE)
+            accuracy = eval_step(params, images, labels)
+            accuracies.append(accuracy)
+        
+        avg_accuracy = np.mean(accuracies)
+        print(f'Epoch {epoch+1}, Accuracy: {avg_accuracy:.4f}')
+        
+        if avg_accuracy > 0.5:
+            print("成功")
+            return True
+    
+    final_accuracy = np.mean(accuracies)
+    print(f"最终准确率: {final_accuracy:.4f}")
+    
+    if final_accuracy > 0.5:
+        print("成功")
+        return True
+    else:
+        print("失败")
+        return False
+
+if __name__ == "__main__":
+    main()
