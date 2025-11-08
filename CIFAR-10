@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+from flax import nnx
 import optax
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
@@ -26,46 +26,49 @@ test_loader = DataLoader(
     batch_size=BATCH_SIZE, shuffle=False
 )
 
-class SimpleCNN(nn.Module):
-    @nn.compact
+class SimpleCNN(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        super().__init__()
+        self.conv1 = nnx.Conv(3, 32, kernel_size=(3, 3), padding="SAME", rngs=rngs)
+        self.conv2 = nnx.Conv(32, 64, kernel_size=(3, 3), padding="SAME", rngs=rngs)
+        self.fc1 = nnx.Linear(64 * 8 * 8, 256, rngs=rngs)
+        self.fc2 = nnx.Linear(256, 10, rngs=rngs)
+    
     def __call__(self, x):
-        x = nn.Conv(features=32, kernel_size=(3, 3), padding="SAME")(x)
-        x = nn.relu(x)
-        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
-        
-        x = nn.Conv(features=64, kernel_size=(3, 3), padding="SAME")(x)
-        x = nn.relu(x)
-        x = nn.max_pool(x, window_shape=(2, 2), strides=(2, 2))
-        
+        x = self.conv1(x)
+        x = nnx.relu(x)
+        x = nnx.max_pool(x, window_shape=(2, 2), strides=(2, 2))
+        x = self.conv2(x)
+        x = nnx.relu(x)
+        x = nnx.max_pool(x, window_shape=(2, 2), strides=(2, 2))
         x = x.reshape(x.shape[0], -1)
-        x = nn.Dense(features=256)(x)
-        x = nn.relu(x)
-        x = nn.Dense(features=10)(x)
+        x = self.fc1(x)
+        x = nnx.relu(x)
+        x = self.fc2(x)
         return x
 
-def create_train_state(rng):
-    model = SimpleCNN()
-    dummy_input = jnp.ones([1, 32, 32, 3])
-    params = model.init(rng, dummy_input)['params']
-    tx = optax.adam(learning_rate=LEARNING_RATE)
-    opt_state = tx.init(params)
-    return model, params, tx, opt_state
+def compute_loss(logits, labels):
+    return optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
 
-def compute_loss(params, images, labels):
-    logits = model.apply({'params': params}, images)
-    loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-    return loss
-
-@jax.jit
-def train_step(params, opt_state, images, labels):
-    loss, grads = jax.value_and_grad(compute_loss)(params, images, labels)
-    updates, opt_state = tx.update(grads, opt_state, params)
+@nnx.jit
+def train_step(graphdef, params, opt_state, batch):
+    images, labels = batch
+    
+    def loss_fn(params):
+        model = nnx.merge(graphdef, params)
+        logits = model(images)
+        return compute_loss(logits, labels)
+    
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
-    return params, opt_state, loss
+    return graphdef, params, opt_state, loss
 
-@jax.jit
-def eval_step(params, images, labels):
-    logits = model.apply({'params': params}, images)
+@nnx.jit
+def eval_step(graphdef, params, batch):
+    images, labels = batch
+    model = nnx.merge(graphdef, params)
+    logits = model(images)
     predictions = jnp.argmax(logits, axis=1)
     accuracy = jnp.mean(predictions == labels)
     return accuracy
@@ -77,25 +80,33 @@ def prepare_batch(batch):
     return images, labels
 
 def main():
-    rng = jax.random.PRNGKey(42)
-    global model, tx
-    model, params, tx, opt_state = create_train_state(rng)
+    rngs = nnx.Rngs(42)
+    model = SimpleCNN(rngs=rngs)
+    graphdef, params = nnx.split(model)
+    
+    global optimizer
+    optimizer = optax.adam(LEARNING_RATE)
+    opt_state = optimizer.init(params)
     
     for epoch in range(EPOCHS):
         train_losses = []
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             images, labels = prepare_batch(batch)
             images = jax.device_put(images, DEVICE)
             labels = jax.device_put(labels, DEVICE)
-            params, opt_state, loss = train_step(params, opt_state, images, labels)
+            graphdef, params, opt_state, loss = train_step(
+                graphdef, params, opt_state, (images, labels)
+            )
             train_losses.append(loss)
+            if batch_idx % 100 == 0:
+                print(f'Epoch: {epoch+1}, Batch: {batch_idx}, Loss: {loss:.4f}')
         
         accuracies = []
         for batch in test_loader:
             images, labels = prepare_batch(batch)
             images = jax.device_put(images, DEVICE)
             labels = jax.device_put(labels, DEVICE)
-            accuracy = eval_step(params, images, labels)
+            accuracy = eval_step(graphdef, params, (images, labels))
             accuracies.append(accuracy)
         
         avg_accuracy = np.mean(accuracies)
