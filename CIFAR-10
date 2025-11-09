@@ -2,29 +2,64 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 import optax
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
+import pickle
+import urllib.request
+import tarfile
+import os
 
 BATCH_SIZE = 64
 LEARNING_RATE = 3e-4
 EPOCHS = 10
 DEVICE = jax.devices()[0]
 
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-])
+class CIFAR10Dataset(Dataset):
+    def __init__(self, root="./data", train=True):
+        self.root = root
+        self.train = train
+        self.download()
+        self.data, self.targets = self.load_data()
+    
+    def download(self):
+        url = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
+        filepath = os.path.join(self.root, "cifar-10-python.tar.gz")
+        
+        if not os.path.exists(filepath):
+            os.makedirs(self.root, exist_ok=True)
+            urllib.request.urlretrieve(url, filepath)
+            
+        extract_path = os.path.join(self.root, "cifar-10-batches-py")
+        if not os.path.exists(extract_path):
+            with tarfile.open(filepath, 'r:gz') as tar:
+                tar.extractall(self.root)
+    
+    def load_data(self):
+        path = os.path.join(self.root, "cifar-10-batches-py")
+        files = [f"data_batch_{i}" for i in range(1, 6)] if self.train else ["test_batch"]
+        
+        data, labels = [], []
+        for file in files:
+            with open(os.path.join(path, file), 'rb') as f:
+                entry = pickle.load(f, encoding='latin1')
+                data.append(entry['data'])
+                labels.extend(entry['labels'])
+        
+        data = np.vstack(data).reshape(-1, 3, 32, 32)
+        return data, np.array(labels)
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        img = self.data[idx].astype(np.float32) / 255.0
+        mean = np.array([0.4914, 0.4822, 0.4465]).reshape(3, 1, 1)
+        std = np.array([0.2023, 0.1994, 0.2010]).reshape(3, 1, 1)
+        img = (img - mean) / std
+        return img, self.targets[idx]
 
-train_loader = DataLoader(
-    datasets.CIFAR10("./data", train=True, download=True, transform=transform),
-    batch_size=BATCH_SIZE, shuffle=True
-)
-
-test_loader = DataLoader(
-    datasets.CIFAR10("./data", train=False, download=True, transform=transform),
-    batch_size=BATCH_SIZE, shuffle=False
-)
+train_loader = DataLoader(CIFAR10Dataset(train=True), batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(CIFAR10Dataset(train=False), batch_size=BATCH_SIZE)
 
 class SimpleCNN(nnx.Module):
     def __init__(self, rngs: nnx.Rngs):
@@ -127,4 +162,4 @@ def main():
         return False
 
 if __name__ == "__main__":
-    main()
+    main()  
